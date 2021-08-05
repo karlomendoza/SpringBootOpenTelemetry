@@ -21,7 +21,7 @@ go to
 
 http://localhost:16686/search
 
-and view the spans created.
+and view the spans created, example Spans are added in the /images folder
 
 # Info
 
