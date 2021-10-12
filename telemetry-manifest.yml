@@ -1,0 +1,330 @@
+# Manifests based on: https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/10790bb5affa048a61cf13ca20bae19b1eca39e8/exporter/datadogexporter/example/example_k8s_manifest.yaml
+# DataDog docs for open standards: https://docs.datadoghq.com/tracing/setup_overview/open_standards/
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-agent-conf
+  labels:
+    app: opentelemetry
+    component: otel-agent-conf
+  namespace: karlo
+data:
+  otel-agent-config: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+          http:
+    exporters:
+      otlp:
+        endpoint: "otel-collector.karlo:4317"
+        insecure: true
+    processors:
+      batch:
+        timeout: 10s
+      memory_limiter:
+        check_interval: 5s
+        limit_percentage: 85
+        spike_limit_percentage: 35
+      resourcedetection:
+        detectors: [env]
+        timeout: 5s
+        override: false
+      k8s_tagger:
+        passthrough: true
+    extensions:
+      health_check: {}
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, resourcedetection, k8s_tagger, batch]
+          exporters: [otlp]
+      extensions: [health_check]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-agent
+  labels:
+    app: opentelemetry
+    component: otel-agent
+  namespace: karlo
+spec:
+  ports:
+    - name: otlp-new # Default endpoint for OpenTelemetry receiver.
+      port: 4317
+      protocol: TCP
+      targetPort: 4317
+    - name: otlp # Default endpoint for OpenTelemetry receiver.
+      port: 55680
+      protocol: TCP
+      targetPort: 55680
+  selector:
+    component: otel-agent
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: otel-agent
+  labels:
+    app: opentelemetry
+    component: otel-agent
+  namespace: karlo
+spec:
+  selector:
+    matchLabels:
+      app: opentelemetry
+      component: otel-agent
+  template:
+    metadata:
+      labels:
+        app: opentelemetry
+        component: otel-agent
+    spec:
+      serviceAccountName: otel-collector
+      containers:
+        - command:
+            - "/otelcontribcol"
+            - "--config=/conf/otel-agent-config.yaml"
+            # Memory Ballast size should be max 1/3 to 1/2 of memory.
+          image: otel/opentelemetry-collector-contrib:0.33.0
+          name: otel-agent
+          resources:
+            limits:
+              cpu: 100m
+              memory: 900Mi
+            requests:
+              cpu: 100m
+              memory: 900Mi
+          ports:
+            - containerPort: 4317  # New Default OpenTelemetry receiver port.
+            - containerPort: 55680 # Default OpenTelemetry receiver port.
+            - containerPort: 8888  # Metrics.
+          env:
+            # Get pod ip so that k8s_tagger can tag resources
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+              # This is picked up by the resource detector
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "k8s.pod.ip=$(POD_IP)"
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: otel-agent-config-vol
+              mountPath: /conf
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 13133 # Health Check extension default port.
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 13133 # Health Check extension default port.
+      volumes:
+        - configMap:
+            name: otel-agent-conf
+            items:
+              - key: otel-agent-config
+                path: otel-agent-config.yaml
+          name: otel-agent-config-vol
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-conf
+  labels:
+    app: opentelemetry
+    component: otel-collector-conf
+  namespace: karlo
+data:
+  otel-collector-config: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+          http:
+    processors:
+      memory_limiter:
+        check_interval: 1s
+        limit_mib: 1600
+        spike_limit_mib: 320
+      batch:
+        timeout: 10s
+      k8s_tagger:
+    extensions:
+      memory_ballast:
+        size_in_percentage: 50
+      health_check: {}
+      zpages: {}
+    exporters:
+      # docs: https://docs.datadoghq.com/tracing/setup_overview/open_standards/
+      datadog:
+        api:
+          key: "${DD_API_KEY}"
+          site: datadoghq.com
+      # docs: https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/9d30ab859658ea335d934056182fd11a744606ca/exporter/googlecloudexporter
+      googlecloud:
+        project: "${GCP_PROJECT_ID}"
+        use_insecure: true
+        timeout: 12s
+    service:
+      extensions: [memory_ballast, health_check, zpages]
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, batch, k8s_tagger]
+          exporters: [datadog, googlecloud]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  labels:
+    app: opentelemetry
+    component: otel-collector
+  namespace: karlo
+spec:
+  ports:
+    - name: otlp-new # Default endpoint for OpenTelemetry receiver.
+      port: 4317
+      protocol: TCP
+      targetPort: 4317
+    - name: otlp # Default endpoint for OpenTelemetry receiver.
+      port: 55680
+      protocol: TCP
+      targetPort: 55680
+  selector:
+    component: otel-collector
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  labels:
+    app: opentelemetry
+    component: otel-collector
+  namespace: karlo
+spec:
+  selector:
+    matchLabels:
+      app: opentelemetry
+      component: otel-collector
+  minReadySeconds: 5
+  progressDeadlineSeconds: 120
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: opentelemetry
+        component: otel-collector
+    spec:
+      serviceAccountName: otel-collector
+      containers:
+        - command:
+            - "/otelcontribcol"
+            - "--config=/conf/otel-collector-config.yaml"
+            - "--log-level=info"
+          image: otel/opentelemetry-collector-contrib:0.34.0
+          name: otel-collector
+          resources:
+            limits:
+              cpu: 500m
+              memory: 500Mi
+            requests:
+              cpu: 500m
+              memory: 500Mi
+          ports:
+            - containerPort: 4317 # New Default endpoint for OpenTelemetry receiver.
+            - containerPort: 55680 # Default endpoint for OpenTelemetry receiver.
+            - containerPort: 8888  # Default endpoint for querying metrics.
+          env:
+            - name: DD_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: datadog
+                  key: apikey
+            - name: GCP_PROJECT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: otel-collector-service-gcp
+                  key: gcp_project_id
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: /apps/secrets/gcp/gcp_account_key.json
+          volumeMounts:
+            - name: otel-collector-config-vol
+              mountPath: /conf
+            - name: otel-collector-service-gcp-account-key
+              mountPath: /apps/secrets/gcp
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 13133 # Health Check extension default port.
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 13133 # Health Check extension default port.
+      volumes:
+        - configMap:
+            name: otel-collector-conf
+            items:
+              - key: otel-collector-config
+                path: otel-collector-config.yaml
+          name: otel-collector-config-vol
+        - name: otel-collector-service-gcp-account-key
+          secret:
+            secretName: otel-collector-service-gcp
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app: otel-collector
+  namespace: karlo
+  name: otel-collector
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app: otel-collector
+  name: otel-collector
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - nodes/metrics
+      - nodes/spec
+      - nodes/proxy
+    verbs:
+      - get
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
+      - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    app: otel-collector
+  name: otel-collector
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: otel-collector
+subjects:
+  - kind: ServiceAccount
+    name: otel-collector
+    namespace: karlo

@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: karlo-test
+  labels:
+    app: opentelemetry
+    component: karlo-test
+  namespace: karlo
+spec:
+  selector:
+    matchLabels:
+      app: opentelemetry
+      component: karlo-test
+  replicas: 15
+  template:
+    metadata:
+      labels:
+        app: opentelemetry
+        component: karlo-test
+    spec:
+      containers:
+        - image: karlomendoza/opentelemetry:10
+          name: karlo-test
+
